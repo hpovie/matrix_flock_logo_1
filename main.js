@@ -586,6 +586,7 @@ function processLogoData(data, logoType) {
                 ? 0.8 + (1 - (normalizedR + normalizedG + normalizedB) / 3) * 0.2  // Smaller variation for Matrix
                 : 1.0;  // Consistent size for Delta
 
+            // store original image coords (ix,iy) too for stratified bucketing
             points.push({
                 x: px,
                 y: py,
@@ -593,7 +594,10 @@ function processLogoData(data, logoType) {
                 r: normalizedR,
                 g: normalizedG,
                 b: normalizedB,
-                size: size
+                size: size,
+                ix: x,
+                iy: y,
+                brightness: (normalizedR + normalizedG + normalizedB) / 3
             });
         }
     }
@@ -603,46 +607,130 @@ function processLogoData(data, logoType) {
     const colorArray = new Float32Array(size * size * 4);
     const sizeArray = new Float32Array(size * size * 4);
 
-    // Fix for particle distribution - ensure even sampling
+    // ---------- NEW: Stratified + weighted sampling for maximum smoothness ----------
     if (points.length > 0) {
-        // For Matrix logo, prioritize edge pixels to preserve fine details
+
+        // Helper: Fisher-Yates shuffle
+        function fisherYatesShuffle(arr) {
+            for (let i = arr.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [arr[i], arr[j]] = [arr[j], arr[i]];
+            }
+        }
+
+        // If matrix: perform stratified bucketing (2D grid) and sample per-bucket
         if (logoType === 'matrix') {
-            // Simple edge detection to prioritize important pixels
-            const edgePoints = [];
-            const otherPoints = [];
-            
-            for (let i = 0; i < points.length; i++) {
-                const point = points[i];
-                // Simple heuristic: bright pixels are likely part of fine details
-                if (point.r > 0.8 || point.g > 0.8 || point.b > 0.8) {
-                    edgePoints.push(point);
-                } else {
-                    otherPoints.push(point);
+            const BUCKETS = 32; // 32x32 grid; tune if needed (higher -> finer stratification)
+            const buckets = new Array(BUCKETS);
+            for (let i = 0; i < BUCKETS; i++) {
+                buckets[i] = new Array(BUCKETS);
+                for (let j = 0; j < BUCKETS; j++) buckets[i][j] = [];
+            }
+
+            // Build buckets using original image coordinates (ix,iy)
+            for (let p of points) {
+                const bx = Math.floor((p.ix / data.width) * BUCKETS);
+                const by = Math.floor((p.iy / data.height) * BUCKETS);
+                const ix = Math.min(BUCKETS - 1, Math.max(0, bx));
+                const iy = Math.min(BUCKETS - 1, Math.max(0, by));
+                buckets[ix][iy].push(p);
+            }
+
+            // Optionally weight edge / bright pixels slightly by duplicating entries
+            // Determine which points are "edge-like" (bright)
+            const weightFactor = 2; // set to 1 for no weighting; >1 emphasizes bright/edge pixels
+            // Count total candidate points
+            let totalPoints = points.length;
+
+            // Compute quota per bucket proportional to bucket size
+            const bucketQuotas = [];
+            let assignedTotal = 0;
+
+            for (let i = 0; i < BUCKETS; i++) {
+                for (let j = 0; j < BUCKETS; j++) {
+                    const count = buckets[i][j].length;
+                    bucketQuotas.push({
+                        i, j, count,
+                        quota: Math.max(0, Math.round((count / totalPoints) * config.particleCount))
+                    });
+                    assignedTotal += Math.max(0, Math.round((count / totalPoints) * config.particleCount));
                 }
             }
-            
-            // Prioritize edge points in the distribution
-            let edgeIndex = 0;
-            let otherIndex = 0;
-            
-            for (let i = 0; i < config.particleCount; i++) {
-                let point;
-                
-                // Alternate between edge and other points
-                if (i % 3 === 0 && edgeIndex < edgePoints.length) {
-                    point = edgePoints[edgeIndex++];
-                } else if (otherIndex < otherPoints.length) {
-                    point = otherPoints[otherIndex++];
-                } else if (edgeIndex < edgePoints.length) {
-                    point = edgePoints[edgeIndex++];
-                } else {
-                    // Fallback: cycle through all points
-                    point = points[i % points.length];
+
+            // Fix rounding remainder
+            let remainder = config.particleCount - assignedTotal;
+            // Sort buckets by count descending to distribute remainder to densest buckets first
+            bucketQuotas.sort((a,b) => b.count - a.count);
+            let k = 0;
+            while (remainder > 0 && k < bucketQuotas.length) {
+                bucketQuotas[k].quota += 1;
+                remainder -= 1;
+                k++;
+                if (k >= bucketQuotas.length) k = 0;
+            }
+
+            // Now sample from each bucket (shuffle bucket, pick quota)
+            const selected = [];
+            for (let bq of bucketQuotas) {
+                const bx = bq.i, by = bq.j;
+                const arr = buckets[bx][by];
+                if (arr.length === 0) continue;
+
+                // Expand weighted list: duplicate bright/edge-ish points
+                const weighted = [];
+                for (let p of arr) {
+                    const times = (p.brightness > 0.8) ? weightFactor : 1;
+                    for (let t = 0; t < times; t++) weighted.push(p);
                 }
-                
-                positionArray[i * 4] = point.x;
-                positionArray[i * 4 + 1] = point.y;
-                positionArray[i * 4 + 2] = point.z;
+
+                // If weighted ended up empty (shouldn't), fallback to arr
+                const pool = weighted.length > 0 ? weighted : arr.slice();
+
+                fisherYatesShuffle(pool);
+
+                // Pick up to quota (allow sampling with replacement if needed)
+                for (let n = 0; n < bq.quota; n++) {
+                    if (pool.length === 0) break;
+                    // Choose element (wrapping index if quota > pool.length)
+                    const p = pool[n % pool.length];
+                    selected.push(p);
+                }
+            }
+
+            // If we still have too few selected (some buckets empty), fill from global pool
+            if (selected.length < config.particleCount) {
+                // Build a global weighted pool and shuffle
+                const global = [];
+                for (let p of points) {
+                    const times = (p.brightness > 0.8) ? weightFactor : 1;
+                    for (let t = 0; t < times; t++) global.push(p);
+                }
+                fisherYatesShuffle(global);
+
+                let i = 0;
+                while (selected.length < config.particleCount && global.length > 0) {
+                    selected.push(global[i % global.length]);
+                    i++;
+                    // if i grows too large, it will just wrap but that's fine as fallback
+                }
+            }
+
+            // If we somehow overshot (due to quotas rounding), trim
+            if (selected.length > config.particleCount) {
+                selected.length = config.particleCount;
+            }
+
+            // Final shuffle of the selected points to remove any remaining ordering bias
+            fisherYatesShuffle(selected);
+
+            // Write into textures with small jitter
+            const extraJitter = 0.02;
+            for (let i = 0; i < config.particleCount; i++) {
+                const point = selected[i % selected.length];
+
+                positionArray[i * 4] = point.x + (Math.random() - 0.5) * extraJitter;
+                positionArray[i * 4 + 1] = point.y + (Math.random() - 0.5) * extraJitter;
+                positionArray[i * 4 + 2] = point.z + (Math.random() - 0.5) * extraJitter;
                 positionArray[i * 4 + 3] = 1.0;
 
                 colorArray[i * 4] = point.r;
@@ -652,8 +740,9 @@ function processLogoData(data, logoType) {
 
                 sizeArray[i * 4] = point.size;
             }
+
         } else {
-            // For Delta logo, use the standard distribution
+            // For Delta logo, use the standard distribution (shuffled indices) but keep unchanged behavior
             const repetitions = Math.ceil(config.particleCount / points.length);
             
             // Create a shuffled index array to avoid spatial correlation
